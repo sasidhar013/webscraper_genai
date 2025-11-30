@@ -1,0 +1,37 @@
+{
+  "url": "https://elitedatascience.com/learn-machine-learning",
+  "status": 200,
+  "extracted_data": {
+    "books": [
+      "An Introduction to Statistical Learning",
+      "Elements of Statistical Learning"
+    ],
+    "techniques": [
+      "Machine Learning",
+      "Data Science",
+      "Big Data",
+      "Artificial Intelligence",
+      "Predictive Analytics",
+      "Computational Statistics",
+      "Data Mining",
+      "Supervised Learning",
+      "Unsupervised Learning",
+      "Reinforcement Learning",
+      "PCA",
+      "Regularization",
+      "Decision Tree",
+      "Regression",
+      "Clustering algorithms",
+      "Bias-Variance tradeoff",
+      "Optimization algorithms",
+      "Data Preprocessing",
+      "Sampling & Splitting",
+      "Classification models",
+      "Factor analysis models",
+      "Model Evaluation",
+      "Ensemble Learning",
+      "Feature-engineering"
+    ]
+  },
+  "error": null
+}
