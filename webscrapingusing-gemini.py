@@ -11,9 +11,30 @@ Features:
 
 import os
 import json
-from typing import Dict, List, Optional, Any
+import time
+import re
+from typing import Dict, List, Optional, Any, Tuple
 import requests
 from bs4 import BeautifulSoup
+
+# Advanced scraping tools (optional imports)
+try:
+    from playwright.sync_api import sync_playwright, Browser, Page
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
 
 # Load environment variables from .env file if it exists
 try:
@@ -29,6 +50,71 @@ except ImportError:
 except Exception:
     # If loading fails, continue without .env
     pass
+
+
+# ============================================================================
+# BLOCK DETECTION AND CLASSIFICATION
+# ============================================================================
+
+class BlockDetector:
+    """Detects and classifies different types of website blocks."""
+    
+    @staticmethod
+    def detect_block_type(response: requests.Response, html_content: str = "") -> str:
+        """
+        Detect and classify the type of block.
+        
+        Returns:
+            'cloudflare' - Cloudflare protection
+            '403' - Simple 403 Forbidden
+            'javascript' - Requires JavaScript
+            'captcha' - CAPTCHA challenge
+            'rate_limit' - Rate limiting
+            'none' - No block detected
+        """
+        status_code = response.status_code
+        
+        # Check status code
+        if status_code == 403:
+            html_lower = html_content.lower()
+            
+            # Cloudflare detection
+            if any(indicator in html_lower for indicator in [
+                'cloudflare', 'cf-ray', 'checking your browser', 
+                'ddos protection', 'just a moment', 'please wait'
+            ]):
+                return 'cloudflare'
+            
+            # CAPTCHA detection
+            if any(indicator in html_lower for indicator in [
+                'captcha', 'recaptcha', 'hcaptcha', 'verify you are human'
+            ]):
+                return 'captcha'
+            
+            return '403'
+        
+        if status_code == 429:
+            return 'rate_limit'
+        
+        # Check for JavaScript requirement
+        html_lower = html_content.lower()
+        if any(indicator in html_lower for indicator in [
+            'javascript is required', 'enable javascript', 
+            'noscript', 'please enable javascript'
+        ]):
+            return 'javascript'
+        
+        return 'none'
+    
+    @staticmethod
+    def can_bypass_with_playwright(block_type: str) -> bool:
+        """Check if Playwright can bypass this block type."""
+        return block_type in ['cloudflare', 'javascript', '403']
+    
+    @staticmethod
+    def can_bypass_with_selenium(block_type: str) -> bool:
+        """Check if Selenium can bypass this block type."""
+        return block_type in ['javascript', '403']
 
 
 # ============================================================================
@@ -60,54 +146,150 @@ class AIScraper:
         except ImportError:
             raise ImportError("google-generativeai package not installed. Install with: pip install google-generativeai")
     
+    def _fetch_with_requests(self, url: str) -> Tuple[Optional[requests.Response], Optional[str], Dict[str, Any]]:
+        """Try fetching with requests library. Returns (response, html_content, error_dict)."""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        }
+        session = requests.Session()
+        session.headers.update(headers)
+        try:
+            response = session.get(url, timeout=15, allow_redirects=True)
+            return response, response.text, {}
+        except Exception as e:
+            return None, None, {"error": str(e), "method": "requests"}
+    
+    def _fetch_with_playwright(self, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Fetch using Playwright (bypasses JavaScript and many blocks)."""
+        if not PLAYWRIGHT_AVAILABLE:
+            return None, {"error": "Playwright not installed. Install with: pip install playwright && playwright install", "method": "playwright"}
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
+                context = browser.new_context(
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    locale='en-US', timezone_id='America/New_York'
+                )
+                page = context.new_page()
+                page.goto(url, wait_until='networkidle', timeout=30000)
+                time.sleep(2)
+                html_content = page.content()
+                browser.close()
+                return html_content, {}
+        except Exception as e:
+            return None, {"error": str(e), "method": "playwright"}
+    
+    def _fetch_with_selenium(self, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Fetch using Selenium (fallback method)."""
+        if not SELENIUM_AVAILABLE:
+            return None, {"error": "Selenium not installed. Install with: pip install selenium", "method": "selenium"}
+        driver = None
+        try:
+            chrome_options = ChromeOptions()
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.set_page_load_timeout(30)
+            driver.get(url)
+            time.sleep(3)
+            html_content = driver.page_source
+            driver.quit()
+            return html_content, {}
+        except Exception as e:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+            return None, {"error": str(e), "method": "selenium"}
+    
     def _fetch_webpage(self, url: str) -> Dict[str, Any]:
         """
-        Fetch webpage content.
-        
-        Args:
-            url: URL to fetch
-        
-        Returns:
-            Dictionary with HTML content and metadata
+        Smart webpage fetcher that tries multiple methods to bypass blocks.
+        Strategy: 1) Try requests, 2) Detect block type, 3) Try Playwright, 4) Fallback to Selenium.
         """
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        # Step 1: Try requests first
+        response, html_content, error = self._fetch_with_requests(url)
         
-        try:
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove script and style elements
+        if response and response.status_code == 200:
+            soup = BeautifulSoup(html_content, 'html.parser')
             for element in soup(["script", "style", "nav", "footer", "header"]):
                 element.decompose()
-            
-            # Get clean text
             text_content = soup.get_text(separator='\n', strip=True)
-            
-            # Get HTML (limited to avoid token limits)
-            html_content = str(soup)[:50000]  # Limit HTML to 50k chars
-            
+            html_limited = str(soup)[:50000]
             return {
-                "url": url,
-                "status": response.status_code,
-                "text": text_content,
-                "html": html_content,
+                "url": url, "status": 200, "text": text_content, "html": html_limited,
                 "title": soup.title.string if soup.title else None,
                 "links": [a.get('href') for a in soup.find_all('a', href=True)],
-                "error": None
+                "error": None, "method": "requests"
             }
         
-        except Exception as e:
-            return {
-                "url": url,
-                "status": None,
-                "text": None,
-                "html": None,
-                "error": str(e)
-            }
+        # Step 2: Detect block type
+        block_type = 'unknown'
+        if response:
+            block_type = BlockDetector.detect_block_type(response, html_content or "")
+            print(f"⚠️  Block detected: {block_type} (Status: {response.status_code})")
+        
+        # Step 3: Try Playwright
+        if BlockDetector.can_bypass_with_playwright(block_type) or not response:
+            print("🔄 Trying Playwright...")
+            html_content, error = self._fetch_with_playwright(url)
+            if html_content and not error:
+                soup = BeautifulSoup(html_content, 'html.parser')
+                for element in soup(["script", "style", "nav", "footer", "header"]):
+                    element.decompose()
+                text_content = soup.get_text(separator='\n', strip=True)
+                html_limited = str(soup)[:50000]
+                return {
+                    "url": url, "status": 200, "text": text_content, "html": html_limited,
+                    "title": soup.title.string if soup.title else None,
+                    "links": [a.get('href') for a in soup.find_all('a', href=True)],
+                    "error": None, "method": "playwright", "block_bypassed": block_type
+                }
+        
+        # Step 4: Fallback to Selenium
+        if BlockDetector.can_bypass_with_selenium(block_type) or not response:
+            print("🔄 Trying Selenium...")
+            html_content, error = self._fetch_with_selenium(url)
+            if html_content and not error:
+                soup = BeautifulSoup(html_content, 'html.parser')
+                for element in soup(["script", "style", "nav", "footer", "header"]):
+                    element.decompose()
+                text_content = soup.get_text(separator='\n', strip=True)
+                html_limited = str(soup)[:50000]
+                return {
+                    "url": url, "status": 200, "text": text_content, "html": html_limited,
+                    "title": soup.title.string if soup.title else None,
+                    "links": [a.get('href') for a in soup.find_all('a', href=True)],
+                    "error": None, "method": "selenium", "block_bypassed": block_type
+                }
+        
+        # All methods failed
+        error_msg = error.get("error", "All scraping methods failed")
+        if response:
+            error_msg = f"Block type: {block_type}, Status: {response.status_code}, {error_msg}"
+        return {
+            "url": url, "status": response.status_code if response else None,
+            "text": None, "html": None, "error": error_msg,
+            "block_type": block_type, "methods_tried": ["requests", "playwright", "selenium"]
+        }
     
     def scrape_with_ai(self, url: str, extraction_prompt: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -136,7 +318,7 @@ Webpage URL: {url}
 Webpage Title: {webpage.get('title', 'N/A')}
 
 Webpage Content:
-{webpage['text'][:15000]}  # Limit to avoid token limits
+{webpage['text'][:15000]}
 
 Please provide:
 1. A clear summary of the main content
@@ -456,82 +638,75 @@ if __name__ == "__main__":
     
     if not api_key:
         print("GOOGLE_API_KEY not set!")
-        print("\nTo set it, choose one of these methods:")
-        print("\n1. Create a .env file (recommended):")
-        print("   - Create a .env file in the project root")
-        print("   - Add your key: GOOGLE_API_KEY=your-key-here")
-        print("\n2. Set environment variable:")
-        print("   Windows PowerShell: $env:GOOGLE_API_KEY='your-key-here'")
-        print("   Windows CMD: set GOOGLE_API_KEY=your-key-here")
-        print("   Linux/Mac: export GOOGLE_API_KEY='your-key-here'")
-        print("\n3. Set it in Python:")
-        print("   import os")
-        print("   os.environ['GOOGLE_API_KEY'] = 'your-key-here'")
-        print("\nTo get a Google API key:")
-        print("   1. Go to https://makersuite.google.com/app/apikey")
-        print("   2. Create a new API key")
-        print("   3. Copy and use it here")
-        print("\nExiting. Please set the API key first.\n")
         exit(1)
     
-    # Example 1: Basic AI scraping
-    print("Example 1: AI-Powered Web Scraping (Gemini)")
-    print("-" * 70)
+    # Get user input
+    print("=" * 70)
+    print("AI-Powered Web Scraper (Google Gemini)")
+    print("=" * 70)
+    start_url = input("\nEnter the website URL: ").strip()
     
-    try:
-        result = scrape_with_ai(
-            "https://elitedatascience.com/learn-machine-learning",
-            extraction_prompt="Extract information about the page, title, and content."
-        )
-        print_summary(result)
-        save_results(result, "gemini_scraped_result.json")
-    except Exception as e:
-        print(f"Error: {e}")
+    if not start_url:
+        print("Error: URL is required!")
+        exit(1)
     
-    print("\n" + "="*70 + "\n")
+    # Ensure URL has protocol
+    if not start_url.startswith(("http://", "https://")):
+        start_url = "https://" + start_url
+
+    # Ask crawling decision
+    crawl_prompt = input(
+        "\nWhat kind of pages should the AI look for when crawling?\n"
+        "(example: documentation, pricing, job listings, blog posts):\n> "
+    ).strip() or "Find relevant and important pages"
+
+    scrape_prompt = input(
+        "\nWhat kind of data should the AI extract from each page?\n"
+        "(example: product names and prices, contact information, article content):\n> "
+    ).strip() or "Extract key information and summarize the content"
+
+    max_pages = int(input("\nHow many pages to crawl? (default 3): ") or 3)
+
+    # Example 1: AI-powered crawling
+    print("\n" + "=" * 70)
+    print("Example 1: AI-Powered Website Crawling (Gemini)")
+    print("=" * 70)
+    print("\nStarting crawl...\n")
+
+    results = crawl_with_ai(
+        start_url=start_url,
+        max_pages=max_pages,
+        crawl_prompt=crawl_prompt
+    )
+
+    save_results(results, "runtime_crawl_results.json")
     
-    # Example 2: AI-powered crawling
-    print("Example 2: AI-Powered Website Crawling (Gemini)")
-    print("-" * 70)
-    
-    try:
-        results = crawl_with_ai(
-            "https://elitedatascience.com/learn-machine-learning",
-            max_pages=3,
-            crawl_prompt="Find pages with unique information"
-        )
-        
-        print(f"\nCrawled {len(results)} pages\n")
-        
-        for i, page in enumerate(results, 1):
-            print(f"Page {i}: {page.get('url', 'N/A')}")
-            if page.get('ai_summary'):
-                print(f"  Summary: {page['ai_summary'][:150]}...")
-            print()
-        
-        save_results(results, "gemini_crawled_results.json")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    print("\n" + "="*70 + "\n")
-    
-    # Example 3: Structured data extraction
-    print("Example 3: Structured Data Extraction (Gemini)")
-    print("-" * 70)
-    
-    try:
-        data = extract_data(
-            "https://elitedatascience.com/learn-machine-learning",
-            schema="books and techniques the page is describing.",
-            api_key=api_key
-        )
-        
-        if data.get('extracted_data'):
-            print("Extracted Data:")
-            print(json.dumps(data['extracted_data'], indent=2))
-            save_results(data, "gemini_extracted_data.json")
+    # Print summary of crawled pages
+    print(f"\n Successfully crawled {len(results)} pages")
+    for i, page in enumerate(results, 1):
+        if page.get('error'):
+            print(f"  Page {i}: Error - {page.get('url', 'N/A')}")
         else:
-            print(f"Error: {data.get('error', 'Unknown error')}")
-    except Exception as e:
-        print(f"Error: {e}")
+            print(f"  Page {i}: {page.get('url', 'N/A')}")
+            if page.get('ai_summary'):
+                summary_preview = page['ai_summary'][:100] + "..." if len(page['ai_summary']) > 100 else page['ai_summary']
+                print(f"         Summary: {summary_preview}")
+    
+    print("\n" + "="*70 + "\n")
+    
+    # Example 2: AI-powered scraping (single page)
+    print("Example 2: AI-Powered Website Scraping (Gemini)")
+    print("-" * 70)
+    
+    print("\nStarting Scrape...\n")
+
+    result = scrape_with_ai(
+        url=start_url,
+        extraction_prompt=scrape_prompt
+    )
+
+    save_results(result, "runtime_scrape_results.json")
+    print_summary(result)
+    
+    print("\n" + "="*70 + "\n")
 
